@@ -1,0 +1,241 @@
+====================================================================
+MEGHAN AI - VERSION v1.0.1 (versionCode 2 / versionName "1.0.1")
+Configuración de release, CI/CD y verificación
+====================================================================
+
+--------------------------------------------------------------------
+1. CONFIGURACIÓN DE VERSIÓN (:app/build.gradle.kts)
+--------------------------------------------------------------------
+android {
+    defaultConfig {
+        applicationId = "com.meghan.ai"
+        minSdk = 24
+        targetSdk = 35
+        versionCode = 2
+        versionName = "1.0.1"
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+    }
+}
+
+--------------------------------------------------------------------
+2. WORKFLOW DE GITHUB ACTIONS (.github/workflows/meghan-release.yml)
+--------------------------------------------------------------------
+name: MEGHAN AI Release Pipeline
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  room-migration-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Cache Gradle and Android SDK
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            ~/.android/build-cache
+          key: gradle-room-migration-${{ hashFiles('**/*.gradle*', 'gradle/libs.versions.toml', '**/schemas/**') }}
+          restore-keys: |
+            gradle-room-migration-
+
+      - name: Enable KVM for hardware-accelerated emulator
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+
+      - name: Run MeghanDatabase migration instrumented tests
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          target: google_apis
+          arch: x86_64
+          avd-name: meghan_migration_avd
+          disable-animations: true
+          script: >
+            ./gradlew :app:connectedDebugAndroidTest
+            -Pandroid.testInstrumentationRunnerArguments.class=com.meghan.core.database.MeghanDatabaseMigrationTest
+
+      - name: Upload migration test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: room-migration-test-reports
+          path: |
+            **/build/reports/androidTests/connected/**
+            **/build/test-results/connected/**
+
+  release-bundle:
+    needs: room-migration-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    permissions:
+      contents: write
+
+    env:
+      MEGHAN_RELEASE_STORE_FILE: keystore/meghan-release.jks
+      MEGHAN_RELEASE_STORE_PASSWORD: ${{ secrets.MEGHAN_RELEASE_STORE_PASSWORD }}
+      MEGHAN_RELEASE_KEY_ALIAS: ${{ secrets.MEGHAN_RELEASE_KEY_ALIAS }}
+      MEGHAN_RELEASE_KEY_PASSWORD: ${{ secrets.MEGHAN_RELEASE_KEY_PASSWORD }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Cache Gradle packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-release-${{ hashFiles('**/*.gradle*', 'gradle/libs.versions.toml') }}
+          restore-keys: |
+            gradle-release-
+
+      - name: Decode release keystore
+        run: |
+          mkdir -p keystore
+          echo "${{ secrets.MEGHAN_RELEASE_KEYSTORE_BASE64 }}" | base64 --decode > "$MEGHAN_RELEASE_STORE_FILE"
+
+      - name: Build signed release AAB with R8
+        run: ./gradlew :app:clean :app:bundleRelease
+
+      - name: Verify release AAB and mapping.txt exist and meet size checks
+        run: |
+          AAB_FILE="app/build/outputs/bundle/release/app-release.aab"
+          MAPPING_FILE="app/build/outputs/mapping/release/mapping.txt"
+          MIN_AAB_BYTES=1048576
+
+          if [ ! -f "$AAB_FILE" ]; then
+            echo "Error: $AAB_FILE does not exist." >&2
+            exit 1
+          fi
+
+          AAB_BYTES=$(wc -c < "$AAB_FILE")
+          if [ "$AAB_BYTES" -lt "$MIN_AAB_BYTES" ]; then
+            echo "Error: $AAB_FILE is too small ($AAB_BYTES bytes < $MIN_AAB_BYTES bytes)." >&2
+            exit 1
+          fi
+
+          if [ ! -s "$MAPPING_FILE" ]; then
+            echo "Error: $MAPPING_FILE is missing or empty." >&2
+            exit 1
+          fi
+
+          echo "Verified $AAB_FILE ($AAB_BYTES bytes) and $MAPPING_FILE ($(wc -c < "$MAPPING_FILE") bytes)"
+
+      - name: Download bundletool
+        run: |
+          mkdir -p tools
+          curl -sSL -o tools/bundletool.jar \
+            https://github.com/google/bundletool/releases/download/1.18.3/bundletool-all-1.18.3.jar
+
+      - name: Validate release AAB with bundletool
+        run: |
+          java -jar tools/bundletool.jar validate \
+            --bundle=app/build/outputs/bundle/release/app-release.aab
+
+      - name: Build signed universal APKs for QA
+        run: |
+          java -jar tools/bundletool.jar build-apks \
+            --bundle=app/build/outputs/bundle/release/app-release.aab \
+            --output=app/build/outputs/bundle/release/meghan-universal.apks \
+            --mode=universal \
+            --ks="$MEGHAN_RELEASE_STORE_FILE" \
+            --ks-key-alias="$MEGHAN_RELEASE_KEY_ALIAS" \
+            --ks-pass="pass:$MEGHAN_RELEASE_STORE_PASSWORD" \
+            --key-pass="pass:$MEGHAN_RELEASE_KEY_PASSWORD"
+
+      - name: Write release artifact sizes to step summary
+        run: |
+          AAB_FILE="app/build/outputs/bundle/release/app-release.aab"
+          APKS_FILE="app/build/outputs/bundle/release/meghan-universal.apks"
+          MAPPING_FILE="app/build/outputs/mapping/release/mapping.txt"
+
+          for f in "$AAB_FILE" "$APKS_FILE" "$MAPPING_FILE"; do
+            if [ ! -s "$f" ]; then
+              echo "Error: missing or empty artifact $f" >&2
+              exit 1
+            fi
+          done
+
+          AAB_BYTES=$(wc -c < "$AAB_FILE")
+          APKS_BYTES=$(wc -c < "$APKS_FILE")
+          MAPPING_BYTES=$(wc -c < "$MAPPING_FILE")
+
+          AAB_SIZE=$(awk "BEGIN { printf \"%.2f MiB\", $AAB_BYTES / 1048576 }")
+          APKS_SIZE=$(awk "BEGIN { printf \"%.2f MiB\", $APKS_BYTES / 1048576 }")
+          MAPPING_SIZE=$(awk "BEGIN { printf \"%.2f KiB\", $MAPPING_BYTES / 1024 }")
+
+          {
+            echo "### MEGHAN AI Release Artifacts"
+            echo ""
+            echo "| Artifact | Bytes | Size |"
+            echo "| --- | --- | --- |"
+            echo "| \`app-release.aab\` | ${AAB_BYTES} | ${AAB_SIZE} |"
+            echo "| \`meghan-universal.apks\` | ${APKS_BYTES} | ${APKS_SIZE} |"
+            echo "| \`mapping.txt\` | ${MAPPING_BYTES} | ${MAPPING_SIZE} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Prepare versioned release assets
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          mkdir -p release-assets
+          TAG_NAME="${GITHUB_REF_NAME}"
+          cp app/build/outputs/bundle/release/app-release.aab "release-assets/meghan-${TAG_NAME}.aab"
+          cp app/build/outputs/bundle/release/meghan-universal.apks "release-assets/meghan-${TAG_NAME}-universal.apks"
+          cp app/build/outputs/mapping/release/mapping.txt "release-assets/meghan-${TAG_NAME}-mapping.txt"
+
+      - name: Clean up sensitive and temporary files
+        if: always()
+        run: rm -rf keystore tools
+
+      - name: Publish GitHub Release with AAB and mapping
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+          generate_release_notes: true
+
+--------------------------------------------------------------------
+3. COMANDOS PARA ETIQUETAR E INSTALAR v1.0.1
+--------------------------------------------------------------------
+# Etiquetar v1.0.1
+git tag -a v1.0.1 -m "Release v1.0.1 - MEGHAN AI"
+git push origin v1.0.1
+
+# Descargar assets del release v1.0.1
+gh release download v1.0.1 --dir artifacts-v1.0.1
+
+# Extraer e instalar con bundletool y adb
+java -jar tools/bundletool.jar get-device-spec --output=device-spec.json
+java -jar tools/bundletool.jar extract-apks \
+  --apks=artifacts-v1.0.1/meghan-v1.0.1-universal.apks \
+  --output-dir=extracted-v1.0.1/ \
+  --device-spec=device-spec.json
+adb install -r extracted-v1.0.1/universal.apk
